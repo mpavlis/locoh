@@ -1,192 +1,156 @@
 library(sf)
 library(RPostgreSQL)
 
-create_postgis_locoh_func <- function(con, clusters_table, geom_field, clusters_field, points_id_field){
-  
-  query <- paste("CREATE OR REPLACE FUNCTION st_locoh_", clusters_table, "(cluster_id integer, knn integer)",
-                 " RETURNS TABLE(focal_gid integer, geom geometry, area double precision, knn_gid integer []) AS $$",
-                 " DECLARE",
-                 " i integer;",
-                 " BEGIN",
-                 " FOR i IN SELECT DISTINCT ON(", clusters_table,".", geom_field,") ", clusters_table,".", points_id_field,
-                 " FROM ", clusters_table, " WHERE ", clusters_table, ".", clusters_field, "= $1",
-                 " LOOP",
-                 " BEGIN RETURN QUERY",
-                 " WITH cluster_sele AS",
-                 " (SELECT DISTINCT ON(",clusters_table,".", geom_field,") ", clusters_table, ".", geom_field, " AS geom,", clusters_table, ".", points_id_field, " AS gid", 
-                 " FROM ", clusters_table, " WHERE ", clusters_table, ".", clusters_field, " = $1),",
-                 " focal_pnt AS",
-                 " (SELECT cluster_sele.gid, cluster_sele.geom FROM cluster_sele WHERE cluster_sele.gid = i),",
-                 " knn_pnts AS",
-                 " (SELECT cluster_sele.gid AS gid, cluster_sele.geom AS geom FROM cluster_sele, focal_pnt",
-                 " WHERE cluster_sele.gid != i ORDER BY cluster_sele.geom <#> focal_pnt.geom LIMIT $2 - 1),",
-                 " c_hull AS",
-                 " (SELECT focal_pnt.gid AS focal_gid, ST_ConvexHull(ST_Collect(cluster_sele.geom)) AS geom, array_agg(DISTINCT knn_pnts.gid) AS knn_gid",
-                 " FROM cluster_sele, focal_pnt, knn_pnts",
-                 " WHERE cluster_sele.gid IN (focal_pnt.gid, knn_pnts.gid) GROUP BY focal_pnt.gid)",
-                 " SELECT c_hull.focal_gid, c_hull.geom, ST_Area(c_hull.geom)/10000 AS area, c_hull.knn_gid FROM c_hull;",
-                 " END;",
-                 " END LOOP;",
-                 " END $$",
-                 " LANGUAGE plpgsql;", sep = "")
-  
-  dbExecute(con, query)
+locoh_postgis_query <- function(con, clusters_table, geom_field, clusters_field, points_id_field, cluster_id, k, rm_holes = F){
+  st_read_db(con, query = paste0("WITH distinct_pnts AS",
+                                  " (SELECT DISTINCT ON(", geom_field, ") geom, ", points_id_field, " id",
+                                  " FROM ", clusters_table, " WHERE ", clusters_field, " = ", cluster_id, ")",
+                                  ifelse (rm_holes, paste0(" SELECT ", cluster_id, " cluster_id, ST_Union(ST_MakePolygon(ST_ExteriorRing(geom))) geom",
+                                                           " FROM ("),""),
+                                  " SELECT ", cluster_id, " cluster_id, ST_Union(geom) geom", 
+                                  " FROM", 
+                                  " (SELECT t1.id, ST_Convexhull(ST_Collect(t2.geom)) geom", 
+                                  " FROM distinct_pnts t1",
+                                  " CROSS JOIN LATERAL", 
+                                  " (SELECT geom FROM distinct_pnts t2", 
+                                  " WHERE t2.id != t1.id", 
+                                  " ORDER by t2.geom <#> t1.geom", 
+                                  " LIMIT ", k, "-1) t2 GROUP BY t1.id) t3",
+                                  ifelse(rm_holes, ") t4 ", "")))
 }
 
-drop_postgis_locoh_func <- function(con, clusters_table){
-  dbExecute(con, paste0("DROP FUNCTION st_locoh_", clusters_table, "(cluster_id integer, knn integer)"))
-}
+# locoh_postgis_multi_clusters <- function(con, clusters_table, geom_field, clusters_field, points_id_field, cluster_ids, k, rm_holes = F){
+#   st_read_db(con, paste0("WITH distinct_pnts AS",
+#                          "(SELECT DISTINCT ON(", geom_field, ") geom, ", points_id_field, " id, ", clusters_field, " cl_id",
+#                          " FROM ", clusters_table, " WHERE ", clusters_field, " IN (", paste0(cluster_ids, collapse = ","), "))",
+#                          ifelse (rm_holes, paste0(" SELECT cl_id, ST_Union(ST_MakePolygon(ST_ExteriorRing(geom))) geom",
+#                                                   " FROM ("),""),
+#                          " SELECT t5.cl_id, ST_Union(t3.geom) geom FROM distinct_pnts t5",
+#                          " CROSS JOIN LATERAL",
+#                          " (SELECT t1.id, ST_Convexhull(ST_Collect(t2.geom)) geom",
+#                          " FROM distinct_pnts t1",
+#                          " CROSS JOIN LATERAL",
+#                          " (SELECT geom FROM distinct_pnts t2",
+#                          " WHERE t2.id != t1.id AND t2.cl_id = t5.cl_id",
+#                          " ORDER by t2.geom <#> t1.geom LIMIT ", k, "-1) t2",
+#                          " GROUP BY t1.id) t3",
+#                          " GROUP BY t5.cl_id",
+#                          ifelse(rm_holes, ") t4 GROUP BY cl_id", "")))
+# }
 
-#################################### 2. postgis_chull_query ###############################################
-# use postgis to create a convex hull from each point to its closest knn - 1 neighbours within a cluster
-# the function will check whether a polygon geometry was returned, if not it will return null
-# if polygons it returns a data frame as: id of focal point, geometry of convex hull and ids of knn - 1
-# the last column is produced from a postgres array and is imported as factor in R
-
-postgis_chull_query <- function(con, clusters_table, cluster_id, k){
-  function_name <- paste("st_locoh", clusters_table, sep = "_")
+locoh_poly <- function(con, clusters_table, geom_field, clusters_field, points_id_field, cluster_id, k, rm_holes){
   tryCatch(
     {
-      Df <- dbGetQuery(con, paste("SELECT focal_gid, knn_gid, ST_AsText(geom) AS geom FROM ", function_name, "(", cluster_id, ",", k, ") ORDER BY area", sep = ""))
+      sf_df <- locoh_postgis_query(con=con, clusters_table = clusters_table, geom_field = geom_field,
+                          clusters_field = clusters_field, points_id_field = points_id_field,
+                          cluster_id = cluster_id, k = k, rm_holes = rm_holes)
       # if the geometry is not polygon return null
-      if (any(sapply(Df$geom, function(x) substr(x, 1, 1) != "P"))){
+      if (is.na(st_dimension(sf_df$geom)) | any(sapply(sf_df$geom, function(x) substr(st_as_text(x), 1, 1) != "P"))){
         return(NULL)
       } else {
-        return(Df)
+        return(sf_df)
       }
     },
     # catch any errors from postgis
     error = function(err){
-      warning(paste("The following error was issued for cluster=", cluster_id, ", and k=", k,":", err))
+      warning(paste("The following error was issued for cluster = ", cluster_id, ", and k = ", k,": ", err))
       return(NULL)
     }
   )
 }
 
-######################################### 3. postgis_chull ###################################################
-# Based on the function postgis_chull_query use postgis to return a convex hull for each point within a cluster of points
-# if the provided number of nearest neighbours (k) does not return a polygons geometry try higher k
-# returns a list with two elements: the final k value and the data frame as returned from function postgis_loco_query
-
-postgis_chull <- function(con, clusters_table, cluster_id, k, points_nr){
+.wrap_locoh_poly <- function(con, clusters_table, geom_field, clusters_field, points_id_field, cluster_id, k, rm_holes, points_nr){
   
   # postgis query for convex hull
-  chulls <- postgis_chull_query(con, clusters_table, cluster_id, k)
+  sf_df <- locoh_poly(con, clusters_table, geom_field, clusters_field, points_id_field, cluster_id, k, rm_holes)
   
-  # if postgis_chull_query returned null try k = k + 1 for as long as k < number of points in the cluster
-  if (is.null(chulls)){
+  # if postgis_chull_query returned null try k = k + 1 for as long as k < number of points in the cluster of points
+  if (is.null(sf_df)){
     warning_part_1 <- paste("It was not possible to create the convex hulls for cluster", cluster_id, "and k =", k)
-    while(is.null(chulls) & k < points_nr){
+    while(is.null(sf_df) & k < points_nr){
       k <- k + 1
-      chulls <- postgis_chull_query(con, clusters_table, cluster_id, k)
+      sf_df <- locoh_poly(con, clusters_table, geom_field, clusters_field, points_id_field, cluster_id, k, rm_holes)
     }
     # if still null abort
-    if (is.null(chulls)){
-      warning(paste("It was not possible to create the convex hulls for cluster_id = ",cluster_id))
-      return(NULL)
+    if (is.null(sf_df)){
+      warning(paste("It was not possible to create the local convex hull for cluster_id =", cluster_id))
+      return(list(k = k, poly = NULL))
     }
-    warning(paste(warning_part_1, "returned convex hulls for k =", k))
+    warning(paste(warning_part_1, ", returned local convex hull for k = ", k))
   }
   
   # return list, first element the k value used to produce convex hulls,
   # second element the loco data frame
-  return(list(k = k, chulls = chulls))
+  return(list(k = k, poly = sf_df))
 }
 
-####################################### 4. chulls_to_locoh ###################################################
-# Using the above three functions take the postgis convex hull polygons and return a list with two elements:
-# 1) k = the number of nearest neighbours and 2) poly = a spatial polygons data frame created from the postgis polygons
-# the polygons are selected so as the cumulative probability of points within the catchment area is equal to or lower than the pct threshold
-
-chulls_to_locoh <- function(con, clusters_table, cluster_id, k, points_nr){
-  
-  chulls <- postgis_chull(con, clusters_table, cluster_id, k, points_nr)
-  
-  if (is.null(chulls)) return(NULL)
-  
-  k <- chulls$k
-  chulls <- chulls$chulls
-  
-  if (anyDuplicated(chulls$geom) > 0){
-    idx_rm <- which(duplicated(chulls$geom))
-    chulls <- chulls[-idx_rm, ]
-  }
-  
-  tryCatch(
-    {
-      polys <- st_cast(st_union(st_as_sfc(chulls$geom)), "POLYGON")
-      # polys <- gUnaryUnion(SpatialPolygons(polys))
-    },
-    error = function(err){
-      warning(paste("It was not possible to create local convex hull for cluster=", cluster_id, ", trying next k, error received:", err))
-    }
-  )
-  
-  if (is(polys, "sfc")){
-    return(list(k = k, shp_out=polys))
-  } else {
-    return(NULL)
-  }
-}
-
-
-############################################### Main Function ##########################################
-postgis_locoh <- function(con, clusters_table, clusters_field, cluster_id, k_max = Inf){
+get_locoh <- function(cluster_id, con, clusters_table, clusters_field, geom_field, points_id_field, rm_holes = F, k = NULL, k_max = Inf){
   
   points_nr <- as.integer(dbGetQuery(con, paste("SELECT count(DISTINCT ", geom_field, ") FROM ", clusters_table, " WHERE ", clusters_field, " = ", cluster_id, sep = "")))
   
-  k <- round(sqrt(points_nr))
+  if (points_nr < 3){
+    warning(paste0("there are less than 3 points for cluster ", cluster_id, ", returning empty polygon"))
+    return(st_polygon())
+  }
+  
+  if (k_max > points_nr){
+    k_max <- points_nr
+  }
+  
+  if (is.null(k)){
+    k <- round(sqrt(points_nr))
+  }
   
   if (k > k_max){
     k <- k_max
   } 
   
   # locoh <- chulls_to_locoh(clusters_table, cluster_id, k, points_nr, pct)
-  temp_locoh <- chulls_to_locoh(con, clusters_table, cluster_id, k, points_nr)
+  temp_locoh <- .wrap_locoh_poly(con, clusters_table, geom_field, clusters_field, points_id_field, cluster_id, k, rm_holes, points_nr)
   
   # make sure that it's a single polygon
-  while ((is.null(temp_locoh) | length(temp_locoh$shp_out) > 1) & k < points_nr){
+  while ((is.null(temp_locoh$poly) | length(temp_locoh$poly$geom) > 1) & k < k_max){
     k <- temp_locoh$k + 1
-    temp_locoh <- chulls_to_locoh(con, clusters_table, cluster_id, k, points_nr)
+    temp_locoh <- .wrap_locoh_poly(con, clusters_table, geom_field, clusters_field, points_id_field, cluster_id, k, rm_holes, points_nr)
   }
   
-  if (is.null(temp_locoh)){
+  if (is.null(temp_locoh$poly)){
     warning(paste("It was not possible to create local convex hull for cluster =", cluster_id))
-    return(NULL)
+    return(st_polygon())
   }
   
-  area_start <- st_area(temp_locoh$shp_out)/10000
-  k_start <- temp_locoh$k
+  area_init <- sum(as.numeric(st_area(temp_locoh$poly))/10000)
+  k <- temp_locoh$k + 1
   
-  if (area_start < 1.1){
+  if (area_init < 1.1){
     area_threshold <- 0.001
   } else {
-    area_threshold <- log(area_start) / 100
+    area_threshold <- log(area_init) / 100
   }
   
-  k <- k_start + 1
-  area <- area_start
+  area <- area_init
   
   locoh <- temp_locoh
   
   # optimize locoh area: if the area has not plataued then try a higher k
-  while (k < points_nr & k < k_max & all(diff(area, 1) > area_threshold) & area[length(area)] < area_start + area_start / 3){
-    temp_locoh <- chulls_to_locoh(con, clusters_table, cluster_id, k, points_nr)
-    if (! is.null(temp_locoh) ){
-      area <- c(area, st_area(temp_locoh$shp_out)/10000)
-      k <- temp_locoh$k + 1
-      locoh <- temp_locoh
-    } else {
-      next()
+  while (k < k_max & all(diff(area, 1) > area_threshold) & area[length(area)] < area_init + area_init / 3){
+    temp_locoh <- .wrap_locoh_poly(con, clusters_table, geom_field, clusters_field, points_id_field, cluster_id, k, rm_holes, points_nr)
+    if (! is.null(temp_locoh$poly)){
+      new_area <- sum(as.numeric(st_area(temp_locoh$poly))/10000)
+      if (new_area > area[length(area)]){
+        locoh <- temp_locoh
+      }
+      area <- c(area, new_area)
     }
+    k <- temp_locoh$k + 1
   }
   
   # do.call(rbind, lapply(locoh$shp_out, function(x) unlist(x)))
-  if (length(locoh$shp_out) > 1){
-    st_cast(locoh$shp_out, "MULTIPOLYGON")
+  if (length(locoh$poly$geom) > 1){
+    return(st_union(locoh$poly))
+  } else if (is.null(locoh$poly)){
+    return(st_polygon())
   } else {
-    locoh$shp_out
+    return(locoh$poly)
   }
-  
 }
-
